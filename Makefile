@@ -1,11 +1,42 @@
 TAG := `git describe --tags --always`
 VERSION :=
 
+CONTAINER_RUNTIME ?= docker
 CONTAINER_REPO ?= ghcr.io/inspektor-gadget/inspektor-gadget
+
+GADGET_CONTAINERS = \
+	gadget-default-container \
+	gadget-core-container
+
 IMAGE_TAG ?= $(shell ./tools/image-tag branch)
 
-MINIKUBE ?= minikube
+LDFLAGS := "-X main.version=$(VERSION) \
+-X main.gadgetimage=$(CONTAINER_REPO):$(IMAGE_TAG) \
+-extldflags '-static'"
+
+LOCAL_GADGET_TARGETS = \
+	local-gadget-linux-amd64 \
+	local-gadget-linux-arm64
+
+LIVENESS_PROBE ?= true
+
+MINIKUBE ?= $(shell pwd)/bin/minikube-$(MINIKUBE_VERSION)
+MINIKUBE_DRIVER ?= docker
+MINIKUBE_VERSION ?= v1.27.0
+MINIKUBE_SETUP_TARGETS = \
+	minikube-setup-docker \
+	minikube-setup-containerd \
+	minikube-setup-cri-o
+
+KUBERNETES_VERSION ?= v1.24.6
 KUBERNETES_DISTRIBUTION ?= ""
+
+KUBECTL_GADGET_TARGETS = \
+	kubectl-gadget-linux-amd64 \
+	kubectl-gadget-linux-arm64 \
+	kubectl-gadget-darwin-amd64 \
+	kubectl-gadget-darwin-arm64 \
+	kubectl-gadget-windows-amd64
 
 GOHOSTOS ?= $(shell go env GOHOSTOS)
 GOHOSTARCH ?= $(shell go env GOHOSTARCH)
@@ -16,6 +47,11 @@ ENABLE_BTFGEN ?= false
 
 BPFTOOL ?= bpftool
 ARCH ?= $(shell uname -m | sed 's/x86_64/x86/' | sed 's/aarch64/arm64/' | sed 's/ppc64le/powerpc/' | sed 's/mips.*/mips/')
+
+LOCAL_GADGET_INTEGRATION_TEST_TARGETS = \
+	local-gadget-integration-tests-docker \
+	local-gadget-integration-tests-containerd \
+	local-gadget-integration-tests-cri-o
 
 # Adds a '-dirty' suffix to version string if there are uncommitted changes
 changes := $(shell git status --porcelain)
@@ -38,10 +74,6 @@ export BPFTOOL ARCH
 include crd.mk
 include tests.mk
 
-LDFLAGS := "-X main.version=$(VERSION) \
--X main.gadgetimage=$(CONTAINER_REPO):$(IMAGE_TAG) \
--extldflags '-static'"
-
 .DEFAULT_GOAL := build
 .PHONY: build
 build: manifests generate kubectl-gadget gadget-default-container
@@ -50,60 +82,51 @@ build: manifests generate kubectl-gadget gadget-default-container
 all: build local-gadget
 
 # make does not allow implicit rules (with '%') to be phony so let's use
-# the 'phony_explicit' dependency to make implicit rules inherit the phony
+# the 'phony-explicit' dependency to make implicit rules inherit the phony
 # attribute
-.PHONY: phony_explicit
-phony_explicit:
+.PHONY: phony-explicit
+phony-explicit:
 
 ebpf-objects:
-	docker run -it --rm --name ebpf-object-builder --user $(shell id -u):$(shell id -g) -v $(shell pwd):/work ghcr.io/inspektor-gadget/inspektor-gadget-ebpf-builder
+	docker run -it --rm \
+		--name ebpf-object-builder \
+		--user $(shell id -u):$(shell id -g) \
+		-v $(shell pwd):/work ghcr.io/inspektor-gadget/inspektor-gadget-ebpf-builder
 
 ebpf-objects-outside-docker:
 	TARGET=arm64 go generate ./...
 	TARGET=amd64 go generate ./...
 
 # local-gadget
-
-LOCAL_GADGET_TARGETS = \
-	local-gadget-linux-amd64 \
-	local-gadget-linux-arm64
-
 .PHONY: list-local-gadget-targets
 list-local-gadget-targets:
 	@echo $(LOCAL_GADGET_TARGETS)
 
-.PHONY: local-gadget-all
-local-gadget-all: $(LOCAL_GADGET_TARGETS) local-gadget
+.PHONY: build-local-gadget-all build-local-gadget
+build-local-gadget-all: $(LOCAL_GADGET_TARGETS) build-local-gadget
 
-local-gadget: local-gadget-$(GOHOSTOS)-$(GOHOSTARCH)
-	cp local-gadget-$(GOHOSTOS)-$(GOHOSTARCH) local-gadget
+build-local-gadget: build-local-gadget-linux-$(GOHOSTARCH)
+	cp local-gadget-linux-$(GOHOSTARCH) local-gadget
 
-local-gadget-%: phony_explicit
+build-local-gadget-%: phony-explicit
 	echo Building local-gadget-$* && \
 	export GOOS=$(shell echo $* |cut -f1 -d-) GOARCH=$(shell echo $* |cut -f2 -d-) && \
 	docker buildx build -t local-gadget-$*-builder -f Dockerfiles/local-gadget.Dockerfile \
-		--build-arg GOOS=$${GOOS} --build-arg GOARCH=$${GOARCH} --build-arg VERSION=$(VERSION) . && \
+		--build-arg GOOS=linux --build-arg GOARCH=$${GOARCH} --build-arg VERSION=$(VERSION) . && \
 	docker run --rm --entrypoint cat local-gadget-$*-builder local-gadget-$* > local-gadget-$* && \
 	chmod +x local-gadget-$*
-
-KUBECTL_GADGET_TARGETS = \
-	kubectl-gadget-linux-amd64 \
-	kubectl-gadget-linux-arm64 \
-	kubectl-gadget-darwin-amd64 \
-	kubectl-gadget-darwin-arm64 \
-	kubectl-gadget-windows-amd64
 
 .PHONY: list-kubectl-gadget-targets
 list-kubectl-gadget-targets:
 	@echo $(KUBECTL_GADGET_TARGETS)
 
-.PHONY: kubectl-gadget-all
+.PHONY: kubectl-gadget-all kubectl-gadget
 kubectl-gadget-all: $(KUBECTL_GADGET_TARGETS) kubectl-gadget
 
 kubectl-gadget: kubectl-gadget-$(GOHOSTOS)-$(GOHOSTARCH)
 	cp kubectl-gadget-$(GOHOSTOS)-$(GOHOSTARCH) kubectl-gadget
 
-kubectl-gadget-%: phony_explicit
+kubectl-gadget-%: phony-explicit
 	export GO111MODULE=on CGO_ENABLED=0 && \
 	export GOOS=$(shell echo $* |cut -f1 -d-) GOARCH=$(shell echo $* |cut -f2 -d-) && \
 	go build -ldflags $(LDFLAGS) \
@@ -114,10 +137,6 @@ kubectl-gadget-%: phony_explicit
 install/kubectl-gadget: kubectl-gadget-$(GOHOSTOS)-$(GOHOSTARCH)
 	mkdir -p ~/.local/bin/
 	cp kubectl-gadget-$(GOHOSTOS)-$(GOHOSTARCH) ~/.local/bin/kubectl-gadget
-
-GADGET_CONTAINERS = \
-	gadget-default-container \
-	gadget-core-container
 
 gadget-container-all: $(GADGET_CONTAINERS)
 
@@ -157,13 +176,13 @@ local-gadget-tests:
 	# available in the root environment
 	go test -c ./pkg/local-gadget-manager \
 		-tags withebpf
-	sudo ./local-gadget-manager.test -test.v -root-test $$LOCAL_GADGET_TESTS_PARAMS
+	sudo ./local-gadget-manager.test -test.v -root-test $${LOCAL_GADGET_TESTS_PARAMS}
 	rm -f ./local-gadget-manager.test
 
 # INTEGRATION_TESTS_PARAMS can be used to pass additional parameters locally e.g
 # INTEGRATION_TESTS_PARAMS="-run TestExecsnoop -v -no-deploy-ig -no-deploy-spo" make integration-tests
-.PHONY: integration-tests
-integration-tests: kubectl-gadget
+.PHONY: inspektor-gadget-integration-tests local-gadget-integration-tests
+inspektor-gadget-integration-tests: kubectl-gadget
 	KUBECTL_GADGET="$(shell pwd)/kubectl-gadget" \
 		go test ./integration/inspektor-gadget/... \
 			-integration \
@@ -173,7 +192,27 @@ integration-tests: kubectl-gadget
 			-image $(CONTAINER_REPO):$(IMAGE_TAG) \
 			$$INTEGRATION_TESTS_PARAMS
 
-.PHONY: generate-documentation
+local-gadget-integration-tests-all: $(LOCAL_GADGET_INTEGRATION_TEST_TARGETS) test
+
+local-gadget-integration-tests: local-gadget-integration-tests-$(CONTAINER_RUNTIME)
+
+local-gadget-integration-tests-%: build-local-gadget
+	@export MINIKUBE_PROFILE=minikube-$* && \
+	echo "Checking minikube with profile $${MINIKUBE_PROFILE} is running ..." && \
+	$(MINIKUBE) status -p $${MINIKUBE_PROFILE} -f {{.APIServer}} >/dev/null || (echo "Error: $${MINIKUBE_PROFILE} not running, exiting ..." && exit 1) && \
+	echo "Preparing minikube with profile $${MINIKUBE_PROFILE} for testing ..." && \
+	$(MINIKUBE) cp local-gadget-linux-${GOHOSTARCH} $${MINIKUBE_PROFILE}:/bin/local-gadget >/dev/null && \
+	$(MINIKUBE) ssh sudo chmod +x /bin/local-gadget && \
+	go test -c -o local-gadget-integration.test ./integration/local-gadget && \
+	$(MINIKUBE) cp local-gadget-integration.test $${MINIKUBE_PROFILE}:/bin/local-gadget-integration.test >/dev/null && \
+	$(MINIKUBE) ssh sudo chmod +x /bin/local-gadget-integration.test && \
+	rm local-gadget-integration.test && \
+	$(MINIKUBE) -p $${MINIKUBE_PROFILE} ssh "sudo ln -sf /var/lib/minikube/binaries/$(KUBERNETES_VERSION)/kubectl /bin/kubectl" && \
+	$(MINIKUBE) -p $${MINIKUBE_PROFILE} ssh "sudo ln -sf /etc/kubernetes/admin.conf /root/.kube/config" && \
+	echo "Running test in minikube with profile $${MINIKUBE_PROFILE} ..." && \
+	$(MINIKUBE) -p $${MINIKUBE_PROFILE} ssh "sudo local-gadget-integration.test -test.v -integration -container-runtime $* $${INTEGRATION_TESTS_PARAMS}"
+
+.PHONY: generate-documentation lint
 generate-documentation:
 	go run -tags docs cmd/gen-doc/gen-doc.go -repo $(shell pwd)
 
@@ -189,9 +228,31 @@ lint:
 		golangci/golangci-lint:v1.49.0 golangci-lint run --fix
 
 # minikube
-LIVENESS_PROBE ?= true
-.PHONY: minikube-install
-minikube-install: gadget-default-container kubectl-gadget
+.PHONY: minikube-download
+minikube-download:
+	mkdir -p bin
+	test -e bin/minikube-$(MINIKUBE_VERSION) || \
+	(cd bin && curl -Lo ./minikube-$(MINIKUBE_VERSION) https://github.com/kubernetes/minikube/releases/download/$(MINIKUBE_VERSION)/minikube-$(shell go env GOHOSTOS)-$(shell go env GOHOSTARCH))
+	chmod +x bin/minikube-$(MINIKUBE_VERSION)
+
+.PHONY: minikube-clean
+minikube-clean:
+	$(MINIKUBE) delete -p minikube-docker
+	$(MINIKUBE) delete -p minikube-containerd
+	$(MINIKUBE) delete -p minikube-cri-o
+	rm -rf bin
+
+.PHONY: minikube-setup-all minikube-setup
+minikube-setup-all: $(MINIKUBE_SETUP_TARGETS)
+
+minikube-setup: minikube-setup-$(CONTAINER_RUNTIME)
+
+minikube-setup-%: minikube-download
+	$(MINIKUBE) status -p minikube-$* -f {{.APIServer}} >/dev/null || \
+	$(MINIKUBE) start -p minikube-$* --driver=$(MINIKUBE_DRIVER) --kubernetes-version=$(KUBERNETES_VERSION) --container-runtime=$* --wait=all
+
+.PHONY: minikube-inspektor-gadget-install
+minikube-inspektor-gadget-install: gadget-default-container kubectl-gadget
 	@echo "Image on the host:"
 	docker image list --format "table {{.ID}}\t{{.Repository}}:{{.Tag}}\t{{.Size}}" |grep $(CONTAINER_REPO):$(IMAGE_TAG)
 	@echo

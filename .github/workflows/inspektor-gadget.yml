@@ -503,7 +503,7 @@ jobs:
           sudo apt-get install docker-ce
       - name: Run integration for container runtime ${{ matrix.runtime }}
         run: |
-          make -C integration/local-gadget CONTAINER_RUNTIME=${{ matrix.runtime }} -o build setup test
+          make CONTAINER_RUNTIME=${{ matrix.runtime }} -o minikube-setup local-gadget-integration-tests
 
   test-integration-aks:
     name: Integration tests on AKS
